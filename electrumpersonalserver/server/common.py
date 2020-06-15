@@ -59,6 +59,21 @@ def create_server_socket(hostport):
     logger.info("Listening for Electrum Wallet on " + str(hostport))
     return server_sock
 
+def create_ssl_context(certfile, keyfile, client_certfile, cert_reqs):
+    logger = logging.getLogger('ELECTRUMPERSONALSERVER')
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    try:
+        context.verify_mode = cert_reqs
+        if client_certfile:
+            context.load_verify_locations(cafile=client_certfile)
+    except ssl.SSLError as e:
+        logger.warn('The client certificate is invalid. Authentication is disabled: {}'.format(repr(e)))
+        client_certfile = None
+        cert_reqs=ssl.CERT_NONE
+        context.verify_mode = cert_reqs
+    return context
+
 def run_electrum_server(rpc, txmonitor, config):
     logger = logging.getLogger('ELECTRUMPERSONALSERVER')
     logger.info("Starting electrum server")
@@ -78,7 +93,14 @@ def run_electrum_server(rpc, txmonitor, config):
     poll_interval_connected = int(config.get("bitcoin-rpc",
         "poll_interval_connected"))
     certfile, keyfile = get_certs(config)
-    logger.info('using cert: {}, key: {}'.format(certfile, keyfile))
+    logger.info('using cert: {}, key: {}'.format(certfile, keyfile))   
+    client_certfile = config.get("electrum-server","client_certfile", fallback=None)
+    if client_certfile and os.path.exists(client_certfile):
+        logger.info('using cert: {} for client authentication'.format(client_certfile))
+        cert_reqs=ssl.CERT_REQUIRED
+    else:
+        client_certfile = None
+        cert_reqs=ssl.CERT_NONE      
     disable_mempool_fee_histogram = config.getboolean("electrum-server",
         "disable_mempool_fee_histogram", fallback=False)
     broadcast_method = config.get("electrum-server", "broadcast_method",
@@ -92,19 +114,18 @@ def run_electrum_server(rpc, txmonitor, config):
 
     server_sock = create_server_socket(hostport)
     server_sock.settimeout(poll_interval_listening)
+    context = create_ssl_context(certfile, keyfile, client_certfile, cert_reqs)       
     while True:
         try:
             sock = None
             while sock == None:
-                try:
+                try:                  
                     sock, addr = server_sock.accept()
                     if not any([ip_address(addr[0]) in ipnet
                             for ipnet in ip_whitelist]):
                         logger.debug(addr[0] + " not in whitelist, closing")
                         raise ConnectionRefusedError()
-                    sock = ssl.wrap_socket(sock, server_side=True,
-                        certfile=certfile, keyfile=keyfile,
-                        ssl_version=ssl.PROTOCOL_SSLv23)
+                    sock = context.wrap_socket(sock, server_side=True)
                 except socket.timeout:
                     on_heartbeat_listening(txmonitor)
                 except (ConnectionRefusedError, ssl.SSLError):
