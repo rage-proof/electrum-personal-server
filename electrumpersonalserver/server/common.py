@@ -59,19 +59,16 @@ def create_server_socket(hostport):
     logger.info("Listening for Electrum Wallet on " + str(hostport))
     return server_sock
 
-def create_ssl_context(certfile, keyfile, client_certfile, cert_reqs):
+def create_ssl_context(certfile, keyfile, client_certs_all, cert_reqs):
     logger = logging.getLogger('ELECTRUMPERSONALSERVER')
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     context.load_cert_chain(certfile=certfile, keyfile=keyfile)
     try:
         context.verify_mode = cert_reqs
-        if client_certfile:
-            context.load_verify_locations(cafile=client_certfile)
+        context.load_verify_locations(cadata=client_certs_all)
     except ssl.SSLError as e:
         logger.warn('The client certificate is invalid. Authentication is disabled: {}'.format(repr(e)))
-        client_certfile = None
-        cert_reqs=ssl.CERT_NONE
-        context.verify_mode = cert_reqs
+        context.verify_mode = ssl.CERT_NONE
     return context
 
 def run_electrum_server(rpc, txmonitor, config):
@@ -93,14 +90,9 @@ def run_electrum_server(rpc, txmonitor, config):
     poll_interval_connected = int(config.get("bitcoin-rpc",
         "poll_interval_connected"))
     certfile, keyfile = get_certs(config)
-    logger.info('using cert: {}, key: {}'.format(certfile, keyfile))   
-    client_certfile = config.get("electrum-server","client_certfile", fallback=None)
-    if client_certfile and os.path.exists(client_certfile):
-        logger.info('using cert: {} for client authentication'.format(client_certfile))
-        cert_reqs=ssl.CERT_REQUIRED
-    else:
-        client_certfile = None
-        cert_reqs=ssl.CERT_NONE      
+    logger.info('using cert: {}, key: {}'.format(certfile, keyfile))  
+    client_certs_all = get_client_certs(config)
+    cert_reqs = ssl.CERT_REQUIRED if client_certs_all else ssl.CERT_NONE
     disable_mempool_fee_histogram = config.getboolean("electrum-server",
         "disable_mempool_fee_histogram", fallback=False)
     broadcast_method = config.get("electrum-server", "broadcast_method",
@@ -114,7 +106,7 @@ def run_electrum_server(rpc, txmonitor, config):
 
     server_sock = create_server_socket(hostport)
     server_sock.settimeout(poll_interval_listening)
-    context = create_ssl_context(certfile, keyfile, client_certfile, cert_reqs)       
+    context = create_ssl_context(certfile, keyfile, client_certs_all, cert_reqs)       
     while True:
         try:
             sock = None
@@ -128,8 +120,9 @@ def run_electrum_server(rpc, txmonitor, config):
                     sock = context.wrap_socket(sock, server_side=True)
                 except socket.timeout:
                     on_heartbeat_listening(txmonitor)
-                except (ConnectionRefusedError, ssl.SSLError):
+                except (ConnectionRefusedError, ssl.SSLError) as e:
                     sock.close()
+                    logger.info('Electrum refused from ' + str(addr[0]) + repr(e))
                     sock = None
             logger.info('Electrum connected from ' + str(addr[0]))
 
@@ -176,7 +169,7 @@ def run_electrum_server(rpc, txmonitor, config):
             sock = None
             protocol.on_disconnect()
             time.sleep(0.2)
-
+    
 def get_scriptpubkeys_to_monitor(rpc, config):
     logger = logging.getLogger('ELECTRUMPERSONALSERVER')
     st = time.time()
@@ -281,6 +274,20 @@ def get_scriptpubkeys_to_monitor(rpc, config):
     logger.info("Obtained list of addresses to monitor in " + str(et - st)
         + "sec")
     return False, spks_to_monitor, deterministic_wallets
+
+def get_client_certs(config):
+    logger = logging.getLogger('ELECTRUMPERSONALSERVER')
+    client_certs_all = ''
+    for cert in config.options("client-ssl-certs"):
+        path = config.get("client-ssl-certs", cert)
+        if not os.path.exists(path):
+            logger.info('skip missing client cert: {}'.format(path))
+            continue
+        with open(path, 'r') as f:
+            content_cert = f.read()
+        client_certs_all += content_cert
+        logger.info('add client cert: {} for client authentication'.format(path))
+    return client_certs_all if client_certs_all != '' else None
 
 def get_certs(config):
     from pkg_resources import resource_filename
